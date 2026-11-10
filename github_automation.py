@@ -24,7 +24,7 @@ def main():
 
     while True:
         try:
-            total = int(input("\nHow many updates do you want to push = "))
+            total = int(input("\nHow many updates do you want to push?"))
 
             if total > 0:
                 break
