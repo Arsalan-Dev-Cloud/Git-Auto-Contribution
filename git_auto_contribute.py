@@ -1,54 +1,185 @@
-
+import argparse
 import subprocess
 import sys
 from pathlib import Path
 
 
+REPO_ROOT = None
+
+
+# ==================================================
+# GIT COMMAND EXECUTION
+# ==================================================
+
 def run_git(*args):
+
     return subprocess.run(
         ["git", *args],
         cwd=REPO_ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         encoding="utf-8",
-        errors="replace",
+        errors="replace"
     )
 
 
 def stop(message):
+
     print(f"\nSTOP: {message}")
-    sys.exit(1)
+    raise SystemExit(1)
 
 
-def get_repo_root():
+# ==================================================
+# REPOSITORY DETECTION
+# ==================================================
+
+def find_repository(target):
+
+    target = Path(target).expanduser().resolve()
+
+    if not target.is_dir():
+        stop(f"Directory does not exist: {target}")
+
     result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        [
+            "git",
+            "-C",
+            str(target),
+            "rev-parse",
+            "--show-toplevel"
+        ],
+        capture_output=True,
         text=True,
         encoding="utf-8",
-        errors="replace",
+        errors="replace"
     )
 
     if result.returncode != 0:
-        stop("Run this script inside a Git repository.")
+        stop("No Git repository found.")
 
     return Path(result.stdout.strip()).resolve()
 
 
+# ==================================================
+# REPOSITORY VALIDATION
+# ==================================================
+
+def validate_repository():
+
+    branch = run_git("branch", "--show-current")
+
+    if branch.returncode != 0 or not branch.stdout.strip():
+        stop("Checkout a normal Git branch first.")
+
+    branch_name = branch.stdout.strip()
+
+    remote = run_git(
+        "config",
+        "--get",
+        f"branch.{branch_name}.remote"
+    )
+
+    merge = run_git(
+        "config",
+        "--get",
+        f"branch.{branch_name}.merge"
+    )
+
+    if remote.returncode != 0 or merge.returncode != 0:
+        stop("Configure an upstream remote branch first.")
+
+    remote_name = remote.stdout.strip()
+    merge_ref = merge.stdout.strip()
+
+    if remote_name == "." or not merge_ref.startswith("refs/heads/"):
+        stop("A remote tracking branch is required.")
+
+    upstream = run_git(
+        "rev-parse",
+        "--symbolic-full-name",
+        "@{upstream}"
+    )
+
+    if upstream.returncode != 0:
+        stop("Could not identify the upstream branch.")
+
+    upstream_ref = upstream.stdout.strip()
+
+    if not upstream_ref.startswith("refs/remotes/"):
+        stop("Invalid remote tracking reference.")
+
+    identity = run_git("var", "GIT_AUTHOR_IDENT")
+
+    if identity.returncode != 0:
+        stop("Git author identity is not configured.")
+
+    print(f"Repository : {REPO_ROOT}")
+    print(f"Branch     : {branch_name}")
+    print(f"Remote     : {remote_name}")
+    print(f"Author     : {identity.stdout.strip()}")
+
+    return branch_name, remote_name, merge_ref, upstream_ref
+
+
+# ==================================================
+# GIT OPERATION CHECKS
+# ==================================================
+
+def check_git_operations():
+
+    operations = [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD"
+    ]
+
+    for operation in operations:
+
+        result = run_git(
+            "rev-parse",
+            "-q",
+            "--verify",
+            operation
+        )
+
+        if result.returncode == 0:
+            stop(f"Git operation in progress: {operation}")
+
+
+def ensure_clean_index():
+
+    result = run_git("diff", "--cached", "--quiet")
+
+    if result.returncode == 1:
+        stop(
+            "Staged changes already exist. "
+            "Commit or unstage them manually first."
+        )
+
+    if result.returncode != 0:
+        stop("Could not verify staging area.")
+
+
+# ==================================================
+# DETECT CHANGED FILES
+# ==================================================
+
 def get_changes():
+
     result = run_git(
-        "status", "--porcelain=v1", "-z",
+        "status",
+        "--porcelain=v1",
+        "-z",
         "--untracked-files=all"
     )
 
     if result.returncode != 0:
-        stop("Could not read Git status.")
+        stop("Could not read repository status.")
 
     changes = []
 
     for entry in result.stdout.split("\0"):
+
         if not entry:
             continue
 
@@ -58,117 +189,266 @@ def get_changes():
         status = entry[:2]
         path = entry[3:]
 
-        # Rename/copy entries contain a second path in -z format.
         if "R" in status or "C" in status:
             stop(
-                f"Rename/copy detected for {path}. "
-                "Handle renames manually before running."
+                f"Rename or copy detected: {path}. "
+                "Handle it manually first."
             )
 
-        if (
-            "U" in status
-            or status in {"AA", "DD"}
-        ):
-            stop(f"Resolve merge conflict first: {path}")
+        if "U" in status or status in {"AA", "DD"}:
+            stop(f"Merge conflict detected: {path}")
 
         changes.append((path, status))
 
     return changes
 
 
+# ==================================================
+# SENSITIVE FILE PROTECTION
+# ==================================================
+
 def is_sensitive(path):
+
     parts = path.replace("\\", "/").lower().split("/")
     filename = parts[-1]
 
-    if filename.startswith(".env") and filename not in {
-        ".env.example", ".env.sample", ".env.template"
-    }:
+    allowed_env = {
+        ".env.example",
+        ".env.sample",
+        ".env.template"
+    }
+
+    if filename.startswith(".env") and filename not in allowed_env:
         return True
 
-    if filename in {
-        "id_rsa", "id_ed25519",
-        "credentials.json", "secrets.json"
-    }:
+    sensitive_names = {
+        "id_rsa",
+        "id_ed25519",
+        "credentials.json",
+        "secrets.json"
+    }
+
+    if filename in sensitive_names:
         return True
 
-    if Path(filename).suffix in {
-        ".pem", ".key", ".p12", ".pfx"
-    }:
+    sensitive_extensions = {
+        ".pem",
+        ".key",
+        ".p12",
+        ".pfx"
+    }
+
+    if Path(filename).suffix in sensitive_extensions:
         return True
+
+    sensitive_words = (
+        "secret",
+        "password",
+        "credential",
+        "token"
+    )
 
     return any(
         word in part
         for part in parts
-        for word in ("secret", "password", "credential", "token")
+        for word in sensitive_words
     )
 
 
+# ==================================================
+# COMMIT MESSAGE GENERATION
+# ==================================================
+
 def make_message(path, status):
+
     filename = Path(path.replace("\\", "/")).name
 
     if "D" in status:
         return f"Delete {filename}"
 
-    if status == "??":
+    if status == "??" or "A" in status:
         return f"Add {filename}"
 
     return f"Update {filename}"
 
 
-def ensure_clean_index():
-    result = run_git("diff", "--cached", "--quiet")
+# ==================================================
+# VERIFY REMOTE COMMIT
+# ==================================================
 
-    if result.returncode == 1:
-        stop(
-            "Staged changes already exist. Commit or unstage them "
-            "manually before running this automation."
-        )
+def verify_remote(remote, branch, upstream_ref, commit_hash):
 
-    if result.returncode != 0:
-        stop("Could not verify the staging area.")
+    print("\nVerifying remote commit...")
 
-
-def main():
-    print("=" * 60)
-    print("     FULLY AUTOMATED GIT CONTRIBUTION TOOL")
-    print("=" * 60)
-    print(f"Repository: {REPO_ROOT}")
-
-    branch = run_git("branch", "--show-current")
-
-    if branch.returncode != 0 or not branch.stdout.strip():
-        stop("Checkout a normal branch before running.")
-
-    upstream = run_git(
-        "rev-parse", "--abbrev-ref",
-        "--symbolic-full-name", "@{upstream}"
+    fetch = run_git(
+        "fetch",
+        "--quiet",
+        remote,
+        branch
     )
 
-    if upstream.returncode != 0:
-        stop(
-            "Current branch has no upstream. Configure its "
-            "remote tracking branch before running."
-        )
+    if fetch.returncode != 0:
+        print(fetch.stderr)
+        stop("Could not fetch the remote branch for verification.")
+
+    result = run_git(
+        "merge-base",
+        "--is-ancestor",
+        commit_hash,
+        upstream_ref
+    )
+
+    if result.returncode == 0:
+        print("Remote verification successful.")
+        return True
+
+    stop("The new commit was not found in remote branch history.")
+
+
+# ==================================================
+# PROCESS INDIVIDUAL FILE
+# ==================================================
+
+def process_file(path, status, remote, branch, upstream_ref):
+
+    print("\n" + "-" * 60)
+    print(f"File   : {path}")
+    print(f"Status : {status}")
+
+    if is_sensitive(path):
+        stop(f"Potentially sensitive file detected: {path}")
 
     ensure_clean_index()
 
-    # Avoid silently processing files while a merge is in progress.
-    merge_head = run_git("rev-parse", "-q", "--verify", "MERGE_HEAD")
+    message = make_message(path, status)
 
-    if merge_head.returncode == 0:
-        stop("A merge is in progress. Finish it manually first.")
+    print(f"Message: {message}")
 
-    print(f"Branch: {branch.stdout.strip()}")
-    print(f"Upstream: {upstream.stdout.strip()}")
-    print("\nStarting automatic file-by-file commits and pushes...")
+    # Stage only this file.
+    result = run_git(
+        "add",
+        "-A",
+        "--",
+        path
+    )
+
+    if result.returncode != 0:
+        print(result.stderr)
+        stop(f"Could not stage {path}")
+
+    # Verify staged files.
+    staged = run_git(
+        "diff",
+        "--cached",
+        "--name-only",
+        "-z"
+    )
+
+    if staged.returncode != 0:
+        stop("Could not verify staged files.")
+
+    staged_paths = [
+        item for item in staged.stdout.split("\0") if item
+    ]
+
+    if staged_paths != [path]:
+        stop("Unexpected staged files detected.")
+
+    # Create one commit.
+    result = run_git(
+        "commit",
+        "-m",
+        message
+    )
+
+    if result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr)
+        stop(f"Commit failed: {path}")
+
+    commit = run_git("rev-parse", "HEAD")
+
+    if commit.returncode != 0:
+        stop("Could not retrieve commit hash.")
+
+    commit_hash = commit.stdout.strip()
+
+    print(f"\nCommit created: {commit_hash}")
+
+    # Push this commit.
+    result = run_git(
+        "push",
+        remote,
+        f"HEAD:{branch}"
+    )
+
+    if result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr)
+
+        stop(
+            f"Push failed for {path}. "
+            "The local commit already exists. "
+            "Resolve the problem and push it manually."
+        )
+
+    print("Push command completed.")
+
+    # Verify the remote history.
+    verify_remote(
+        remote,
+        branch,
+        upstream_ref,
+        commit_hash
+    )
+
+    print(f"PUSH VERIFIED: {path}")
+    print(f"COMMIT HASH : {commit_hash}")
+
+    return commit_hash
+
+
+# ==================================================
+# MAIN AUTOMATION
+# ==================================================
+
+def main():
+
+    global REPO_ROOT
+
+    parser = argparse.ArgumentParser(
+        description="Reusable file-by-file Git automation."
+    )
+
+    parser.add_argument(
+        "repository",
+        nargs="?",
+        default=".",
+        help="Path to the target Git repository."
+    )
+
+    args = parser.parse_args()
+
+    REPO_ROOT = find_repository(args.repository)
+
+    print("\n" + "=" * 60)
+    print("          REUSABLE GIT AUTOMATION")
+    print("=" * 60)
+
+    branch, remote, merge_ref, upstream_ref = validate_repository()
+
+    check_git_operations()
+    ensure_clean_index()
+
+    print("\nStarting individual file commits and pushes...")
 
     processed = set()
-    success_count = 0
+    successful = 0
 
     while True:
+
         changes = get_changes()
 
-        # Skip paths already successfully processed this run.
         pending = [
             (path, status)
             for path, status in changes
@@ -180,81 +460,37 @@ def main():
 
         path, status = pending[0]
 
-        print("\n" + "-" * 60)
-        print(f"File: {path}")
-        print(f"Status: {status}")
-
-        if is_sensitive(path):
-            stop(
-                f"Potentially sensitive filename detected: {path}. "
-                "Review it manually before committing."
-            )
-
-        message = make_message(path, status)
-        print(f"Commit message: {message}")
-
-        # Confirm the index is still empty before staging.
-        ensure_clean_index()
-
-        # Stage exactly one path. -- safely handles leading dashes.
-        result = run_git("add", "-A", "--", path)
-
-        if result.returncode != 0:
-            print(result.stderr)
-            stop(f"Could not stage {path}.")
-
-        # Verify that only the selected path is staged.
-        staged = run_git("diff", "--cached", "--name-only", "-z")
-
-        if staged.returncode != 0:
-            stop("Could not verify staged paths.")
-
-        staged_paths = [
-            p for p in staged.stdout.split("\0") if p
-        ]
-
-        if staged_paths != [path]:
-            stop(
-                "Staged paths do not match the selected file. "
-                "No commit or push attempted; inspect Git status."
-            )
-
-        result = run_git("commit", "-m", message, "--", path)
-
-        if result.returncode != 0:
-            print(result.stderr)
-            stop(
-                f"Commit failed for {path}. Inspect Git status "
-                "before continuing."
-            )
-
-        print(f"Committed: {message}")
-
-        result = run_git("push")
-
-        if result.returncode != 0:
-            print(result.stderr)
-            stop(
-                f"Push failed after committing {path}. "
-                "Fix the issue and run 'git push' manually. "
-                "Do not recreate the commit."
-            )
-
-        print(f"Pushed successfully: {path}")
+        commit_hash = process_file(
+            path,
+            status,
+            remote,
+            merge_ref.removeprefix("refs/heads/"),
+            upstream_ref
+        )
 
         processed.add(path)
-        success_count += 1
+        successful += 1
+
+        print(f"\nCompleted commit: {commit_hash}")
+
+    remaining = get_changes()
+
+    if remaining:
+        stop(
+            "Some files changed again during execution. "
+            "Review repository status manually."
+        )
 
     print("\n" + "=" * 60)
-    print("AUTOMATION COMPLETE")
-    print(f"Files committed and pushed: {success_count}")
+    print("              FINAL REPORT")
+    print("=" * 60)
+    print(f"Repository          : {REPO_ROOT}")
+    print(f"Branch              : {branch}")
+    print(f"Verified commits    : {successful}")
+    print("All detected changes processed.")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    REPO_ROOT = get_repo_root()
-
-    if not Path.cwd().resolve().is_relative_to(REPO_ROOT):
-        stop("Run this script from inside the repository.")
 
     main()
